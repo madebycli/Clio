@@ -59,6 +59,7 @@ import io.github.landwarderer.futon.scrobbling.discord.ui.DiscordRpc
 import io.github.landwarderer.futon.stats.domain.StatsCollector
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.ensureActive
@@ -130,7 +131,24 @@ class ReaderViewModel @Inject constructor(
 ) {
     private val intent = MangaIntent(savedStateHandle)
 
+    /** Loads of chapters (opening one, the adjacent ones while scrolling); the reader waits for these. */
     private var loadingJob: Job? = null
+
+    /**
+     * The details of the manga: the known ones first, then the update from the source, which can take minutes for
+     * some extensions. Only the first chapter waits for it (through [loadingJob]); afterwards the update runs
+     * on its own, so scrolling into the next chapter, saving the progress and switching chapters do not wait for
+     * it, and switching chapters does not cancel it.
+     */
+    private var detailsJob: Job? = null
+    private var firstChapterReady: CompletableDeferred<Unit>? = null
+
+    /** Before the first chapter is shown, switching chapters replaces the opening load, as before. */
+    private fun cancelOpeningLoad() {
+        if (firstChapterReady?.isCompleted == false) {
+            detailsJob?.cancel()
+        }
+    }
     private var pageSaveJob: Job? = null
     private var bookmarkJob: Job? = null
     private var stateChangeJob: Job? = null
@@ -241,6 +259,7 @@ class ReaderViewModel @Inject constructor(
 
     fun reload() {
         loadingJob?.cancel()
+        detailsJob?.cancel()
         loadImpl()
     }
 
@@ -336,6 +355,7 @@ class ReaderViewModel @Inject constructor(
 
     fun switchChapter(id: Long, page: Int) {
         val prevJob = loadingJob
+        cancelOpeningLoad()
         loadingJob = launchLoadingJob(Dispatchers.IO) {
             prevJob?.cancelAndJoin()
             content.value = ReaderContent(emptyList(), null)
@@ -348,6 +368,7 @@ class ReaderViewModel @Inject constructor(
 
     fun switchChapterBy(delta: Int) {
         val prevJob = loadingJob
+        cancelOpeningLoad()
         loadingJob = launchLoadingJob(Dispatchers.IO) {
             prevJob?.cancelAndJoin()
             val prevState = readingState.requireValue()
@@ -498,140 +519,157 @@ class ReaderViewModel @Inject constructor(
             settings.smartResumePercentage,
             settings.smartResumePagesRemaining,
         )
-        loadingJob = launchLoadingJob(Dispatchers.IO + EventExceptionHandler(onLoadingError)) {
-            var exception: Throwable? = null
-            var loadedDetails: MangaDetails? = null
-            var initialStart: InitialReaderStart? = null
-            var resumeResolver: SmartResumeResolver? = null
-            var deferredDetails: MangaDetails? = null
-            var savedPageCount = 0
+        val firstChapterReady = CompletableDeferred<Unit>()
+        detailsJob = launchJob(Dispatchers.IO + EventExceptionHandler(onLoadingError)) {
             try {
-                captchaAutoResolveCoordinator.awaitActiveResolve()
-                detailsLoadUseCase(intent, force = false)
-                    .retryWhen { cause, attempt ->
-                        // Opening the reader is an explicit action: solve the captcha silently and retry.
-                        val cf = cause.findCloudFlareException()
-                        attempt < MAX_DETAILS_VERIFICATION_RETRIES && cf is CloudFlareProtectedException &&
-                            captchaAutoResolveCoordinator.resolveIfEnabled(cf)
-                    }
-                    .collect { loaded ->
-                        val details = loaded.copy(mergeRepeatedChapters = settings.isMergeRepeatedChapters)
-                        loadedDetails = details
-                        latestDetails = details
-                        if (mangaDetails.value == null) {
-                            mangaDetails.value = details
+                var exception: Throwable? = null
+                var loadedDetails: MangaDetails? = null
+                var initialStart: InitialReaderStart? = null
+                var resumeResolver: SmartResumeResolver? = null
+                var deferredDetails: MangaDetails? = null
+                var savedPageCount = 0
+                try {
+                    captchaAutoResolveCoordinator.awaitActiveResolve()
+                    detailsLoadUseCase(intent, force = false)
+                        .retryWhen { cause, attempt ->
+                            // Opening the reader is an explicit action: solve the captcha silently and retry.
+                            val cf = cause.findCloudFlareException()
+                            attempt < MAX_DETAILS_VERIFICATION_RETRIES && cf is CloudFlareProtectedException &&
+                                captchaAutoResolveCoordinator.resolveIfEnabled(cf)
                         }
-                        val currentChapterId = readingState.value?.chapterId
-                        val wasCurrentChapterLocal = currentChapterId?.let {
-                            chaptersLoader.peekChapter(it)?.source == LocalMangaSource
-                        } ?: false
-                        chaptersLoader.init(details)
-                        val isCurrentChapterLocal = currentChapterId?.let {
-                            chaptersLoader.peekChapter(it)?.source == LocalMangaSource
-                        } ?: false
-                        val manga = details.toManga()
-                        // obtain state
-                        if (readingState.value == null) {
-                            val start = initialStart ?: getStateFromIntent(manga)?.also { initialStart = it }
-                                ?: return@collect
-                            val chapter = chaptersLoader.peekChapter(start.state.chapterId) ?: return@collect
-                            if (resumeResolver == null) {
-                                val mode = runCatchingCancellable {
-                                    detectReaderModeUseCase(manga, start.state)
-                                }.getOrDefault(settings.defaultReaderMode)
-                                selectedBranch.value = if (details.isMerged) null else chapter.branch
-                                readerMode.value = mode
-                                try {
-                                    check(chaptersLoader.loadSingleChapter(start.state.chapterId)) {
-                                        "Chapter contains no pages"
+                        .collect { loaded ->
+                            val details = loaded.copy(mergeRepeatedChapters = settings.isMergeRepeatedChapters)
+                            loadedDetails = details
+                            latestDetails = details
+                            if (mangaDetails.value == null) {
+                                mangaDetails.value = details
+                            }
+                            val currentChapterId = readingState.value?.chapterId
+                            val wasCurrentChapterLocal = currentChapterId?.let {
+                                chaptersLoader.peekChapter(it)?.source == LocalMangaSource
+                            } ?: false
+                            chaptersLoader.init(details)
+                            val isCurrentChapterLocal = currentChapterId?.let {
+                                chaptersLoader.peekChapter(it)?.source == LocalMangaSource
+                            } ?: false
+                            val manga = details.toManga()
+                            // obtain state
+                            if (readingState.value == null) {
+                                val start = initialStart ?: getStateFromIntent(manga)?.also { initialStart = it }
+                                    ?: return@collect
+                                val chapter = chaptersLoader.peekChapter(start.state.chapterId) ?: return@collect
+                                if (resumeResolver == null) {
+                                    val mode = runCatchingCancellable {
+                                        detectReaderModeUseCase(manga, start.state)
+                                    }.getOrDefault(settings.defaultReaderMode)
+                                    selectedBranch.value = if (details.isMerged) null else chapter.branch
+                                    readerMode.value = mode
+                                    try {
+                                        check(chaptersLoader.loadSingleChapter(start.state.chapterId)) {
+                                            "Chapter contains no pages"
+                                        }
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Throwable) {
+                                        exception = e.mergeWith(exception)
+                                        return@collect
                                     }
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Throwable) {
-                                    exception = e.mergeWith(exception)
-                                    return@collect
+                                    savedPageCount = chaptersLoader.getPagesCount(start.state.chapterId)
+                                    resumeResolver = SmartResumeResolver(
+                                        start.state,
+                                        start.history.takeIf { smartResumeEnabled },
+                                        completionRule,
+                                        waitForUpdates,
+                                    )
                                 }
-                                savedPageCount = chaptersLoader.getPagesCount(start.state.chapterId)
-                                resumeResolver = SmartResumeResolver(
-                                    start.state,
-                                    start.history.takeIf { smartResumeEnabled },
-                                    completionRule,
-                                    waitForUpdates,
-                                )
+                                deferredDetails = details
+                                val newState = resumeResolver?.resolve(
+                                    branchChapterIds = details.chapterListForBranch(chapter.branch).map { it.id },
+                                    savedPageCount = savedPageCount,
+                                    updatesFinished = details.isLoaded,
+                                    loadNext = { chaptersLoader.loadSingleChapter(it, keepCurrentOnEmpty = true) },
+                                ) ?: return@collect
+                                readingState.value = newState
+                                deferredDetails = null
+                            } else if (!wasCurrentChapterLocal && isCurrentChapterLocal) {
+                                readingState.value?.let {
+                                    runCatchingCancellable {
+                                        chaptersLoader.loadSingleChapter(it.chapterId)
+                                    }.onFailure { e ->
+                                        exception = e.mergeWith(exception)
+                                    }
+                                }
                             }
-                            deferredDetails = details
-                            val newState = resumeResolver?.resolve(
-                                branchChapterIds = details.chapterListForBranch(chapter.branch).map { it.id },
-                                savedPageCount = savedPageCount,
-                                updatesFinished = details.isLoaded,
-                                loadNext = { chaptersLoader.loadSingleChapter(it, keepCurrentOnEmpty = true) },
-                            ) ?: return@collect
-                            readingState.value = newState
-                            deferredDetails = null
-                        } else if (!wasCurrentChapterLocal && isCurrentChapterLocal) {
-                            readingState.value?.let {
-                                runCatchingCancellable {
-                                    chaptersLoader.loadSingleChapter(it.chapterId)
-                                }.onFailure { e ->
-                                    exception = e.mergeWith(exception)
-                                }
+                            val isFirstContent = !firstChapterReady.isCompleted
+                            publishReaderContent(details, moveToState = isFirstContent || (!wasCurrentChapterLocal && isCurrentChapterLocal))
+                            if (readingState.value != null) {
+                                firstChapterReady.complete(Unit)
                             }
                         }
-                        publishReaderContent(details)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    exception = e.mergeWith(exception)
+                }
+                // A details flow may finish (or fail) without an isLoaded result. Release a deferred resume.
+                val deferred = deferredDetails
+                val resolver = resumeResolver
+                if (readingState.value == null && deferred != null && resolver != null) {
+                    chaptersLoader.init(deferred)
+                    readingState.value = if (exception != null) {
+                        resolver.fallback()
+                    } else {
+                        resolver.resolve(
+                            branchChapterIds = deferred.chapterListForBranch(selectedBranch.value).map { it.id },
+                            savedPageCount = savedPageCount,
+                            updatesFinished = true,
+                            loadNext = { chaptersLoader.loadSingleChapter(it, keepCurrentOnEmpty = true) },
+                        )
                     }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                exception = e.mergeWith(exception)
-            }
-            // A details flow may finish (or fail) without an isLoaded result. Release a deferred resume.
-            val deferred = deferredDetails
-            val resolver = resumeResolver
-            if (readingState.value == null && deferred != null && resolver != null) {
-                chaptersLoader.init(deferred)
-                readingState.value = if (exception != null) {
-                    resolver.fallback()
-                } else {
-                    resolver.resolve(
-                        branchChapterIds = deferred.chapterListForBranch(selectedBranch.value).map { it.id },
-                        savedPageCount = savedPageCount,
-                        updatesFinished = true,
-                        loadNext = { chaptersLoader.loadSingleChapter(it, keepCurrentOnEmpty = true) },
-                    )
+                    publishReaderContent(deferred)
                 }
-                publishReaderContent(deferred)
-            }
-            if (readingState.value == null) {
-                val loadedManga = loadedDetails // for smart cast
-                if (loadedManga != null) {
-                    mangaDetails.value = loadedManga.filterChapters(selectedBranch.value)
+                if (readingState.value == null) {
+                    val loadedManga = loadedDetails // for smart cast
+                    if (loadedManga != null) {
+                        mangaDetails.value = loadedManga.filterChapters(selectedBranch.value)
+                    }
+                    val loadingError = when {
+                        exception != null -> exception
+                        loadedManga == null || !loadedManga.isLoaded -> null
+                        loadedManga.isRestricted -> EmptyMangaException(
+                            EmptyMangaReason.RESTRICTED,
+                            loadedManga.toManga(),
+                            null,
+                        )
+
+                        loadedManga.allChapters.isEmpty() -> EmptyMangaException(
+                            EmptyMangaReason.NO_CHAPTERS,
+                            loadedManga.toManga(),
+                            null,
+                        )
+
+                        else -> null
+                    } ?: IllegalStateException("Unable to load manga. This should never happen. Please report")
+                    onLoadingError.call(loadingError)
+                } else exception?.let { e ->
+                    // manga has been loaded but error occurred
+                    errorEvent.call(e)
                 }
-                val loadingError = when {
-                    exception != null -> exception
-                    loadedManga == null || !loadedManga.isLoaded -> null
-                    loadedManga.isRestricted -> EmptyMangaException(
-                        EmptyMangaReason.RESTRICTED,
-                        loadedManga.toManga(),
-                        null,
-                    )
-
-                    loadedManga.allChapters.isEmpty() -> EmptyMangaException(
-                        EmptyMangaReason.NO_CHAPTERS,
-                        loadedManga.toManga(),
-                        null,
-                    )
-
-                    else -> null
-                } ?: IllegalStateException("Unable to load manga. This should never happen. Please report")
-                onLoadingError.call(loadingError)
-            } else exception?.let { e ->
-                // manga has been loaded but error occurred
-                errorEvent.call(e)
+            } finally {
+                firstChapterReady.complete(Unit)
             }
         }
+        this.firstChapterReady = firstChapterReady
+        // Chapter loads wait for the first chapter only, not for the whole update of the details; the reader's
+        // loading indicator ("Loading…") likewise only shows while a chapter loads.
+        loadingJob = launchLoadingJob { firstChapterReady.await() }
     }
 
-    private suspend fun publishReaderContent(details: MangaDetails) {
+    /**
+     * [moveToState]: the reader goes to the reading state (opening the manga, the open chapter now read from the
+     * device). An update of the details while reading keeps the position the user scrolled to.
+     */
+    private suspend fun publishReaderContent(details: MangaDetails, moveToState: Boolean = true) {
         mangaDetails.value = details.filterChapters(selectedBranch.value)
         if (!isIncognitoMode.firstNotNull()) {
             readingState.value?.let {
@@ -639,7 +677,7 @@ class ReaderViewModel @Inject constructor(
             }
         }
         notifyStateChanged()
-        content.value = ReaderContent(chaptersLoader.snapshot(), readingState.value)
+        content.value = ReaderContent(chaptersLoader.snapshot(), readingState.value.takeIf { moveToState })
     }
 
     @AnyThread

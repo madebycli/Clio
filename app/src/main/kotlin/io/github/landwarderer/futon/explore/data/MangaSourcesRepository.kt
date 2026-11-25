@@ -242,7 +242,10 @@ class MangaSourcesRepository @Inject constructor(
 		observeIsNsfwDisabled(),
 		observeAllEnabled(),
 		observeSortOrder(),
-	) { skipNsfw, allEnabled, order ->
+		// Extension sources stored before the extensions are loaded (app start) are only known by name; build the
+		// list again once they are loaded, so they become the extension's sources (update button, icon, settings).
+		mihonExtensionManager.installedExtensions,
+	) { skipNsfw, allEnabled, order, _ ->
 		dao.observeAll(!allEnabled, order).map {
 			it.toSources(skipNsfw, order)
 		}

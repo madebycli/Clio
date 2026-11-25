@@ -29,7 +29,13 @@ import io.github.landwarderer.futon.mihon.MihonExtensionManager
 import io.github.landwarderer.futon.mihon.extensions.install.ExtensionInstallService
 import io.github.landwarderer.futon.mihon.extensions.repo.ExternalExtensionRepoRepository
 import io.github.landwarderer.futon.mihon.extensions.repo.ExternalExtensionType
+import io.github.landwarderer.futon.mihon.extensions.update.canCompleteUpdateCheck
+import io.github.landwarderer.futon.mihon.extensions.update.newerInstalledPackages
 import io.github.landwarderer.futon.mihon.extensions.update.parseUpdateSignature
+import io.github.landwarderer.futon.mihon.extensions.update.updateSignature
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
 import io.github.landwarderer.futon.mihon.model.MihonMangaSource
 import io.github.landwarderer.futon.list.ui.model.ListHeader
 import io.github.landwarderer.futon.list.ui.model.ListModel
@@ -128,6 +134,39 @@ class ExploreViewModel @Inject constructor(
 			if (!settings.isSuggestionsEnabled && settings.isTipEnabled(TIP_SUGGESTIONS)) {
 				onShowSuggestionsTip.call(Unit)
 			}
+		}
+		launchJob(Dispatchers.IO) { refreshExtensionUpdates() }
+	}
+
+	/**
+	 * Looks up the extension updates in the repositories once per app start, as the extension manager does when it
+	 * opens, so an update stays shown here after a restart instead of only in the manager. Nothing known is cleared
+	 * when a repository cannot be reached.
+	 */
+	private suspend fun refreshExtensionUpdates() {
+		if (!isExtensionUpdatesChecked.compareAndSet(false, true)) return
+		val installed = withTimeoutOrNull(EXTENSIONS_LOAD_TIMEOUT_MS) {
+			extensionManager.installedExtensions.first { it.isNotEmpty() }
+		} ?: return
+		val signature = runCatchingCancellable {
+			val available = extensionRepos.getAvailableExtensions(ExternalExtensionType.MIHON)
+			val repos = extensionRepos.getByType(ExternalExtensionType.MIHON)
+			if (repos.isEmpty() || !canCompleteUpdateCheck(repos.map { it.lastError })) {
+				null
+			} else {
+				val packages = newerInstalledPackages(
+					installed.associate { it.pkgName to it.versionCode },
+					available.map { it.pkgName to it.versionCode },
+				)
+				val updates = available.filter { it.pkgName in packages }
+					.groupBy { it.pkgName }.map { (_, versions) -> versions.maxBy { it.versionCode } }
+				updateSignature(updates.map { it.pkgName to it.versionCode })
+			}
+		}.getOrNull()
+		if (signature == null) {
+			isExtensionUpdatesChecked.set(false) // try again next time the tab opens
+		} else {
+			settings.pendingExtensionUpdates = signature
 		}
 	}
 
@@ -340,5 +379,9 @@ class ExploreViewModel @Inject constructor(
 
 		private const val TIP_SUGGESTIONS = "suggestions"
 		private const val SUGGESTIONS_COUNT = 8
+		private const val EXTENSIONS_LOAD_TIMEOUT_MS = 30_000L
+
+		/** Once per process: the repositories are asked again only after the app was restarted. */
+		private val isExtensionUpdatesChecked = AtomicBoolean(false)
 	}
 }

@@ -3,6 +3,7 @@
 // as of madebycli/Kototoro 404e596c79e4170f5aa30ea0cccf286dc76b53e8.
 package io.github.landwarderer.futon.details.domain
 
+import io.github.landwarderer.futon.core.model.LocalMangaSource
 import io.github.landwarderer.futon.core.model.isNovel
 import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
@@ -28,8 +29,11 @@ private fun String.isLocalChapterUrl(): Boolean =
 
 /**
  * One representative per repeated chapter (same [getMergeKey]), in the order the keys first appear.
- * The representative is the most recent upload, then a downloaded copy, then one with a group name, then the
+ * The representative is a downloaded copy, then the most recent upload, then one with a group name, then the
  * longest title. Nothing is deleted: the other uploads stay in the chapter groups.
+ *
+ * A downloaded copy goes first: otherwise a newer upload of the same chapter by another group hid the download in
+ * the list (no download mark) and the reader loaded that upload from the source instead of the stored pages.
  */
 fun List<MangaChapter>.mergeRepeated(): List<MangaChapter> {
     if (this.isEmpty()) return this
@@ -39,8 +43,8 @@ fun List<MangaChapter>.mergeRepeated(): List<MangaChapter> {
             groupList.first()
         } else {
             groupList.maxWithOrNull(
-                compareBy<MangaChapter> { it.uploadDate }
-                    .thenBy { it.url.isLocalChapterUrl() }
+                compareBy<MangaChapter> { it.source == LocalMangaSource || it.url.isLocalChapterUrl() }
+                    .thenBy { it.uploadDate }
                     .thenBy { it.scanlator?.isNotBlank() == true }
                     .thenBy { it.title?.length ?: 0 },
             ) ?: groupList.first()
