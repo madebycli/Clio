@@ -291,7 +291,26 @@ class ChapterGroupsTest {
         assertEquals(listOf(old.id), rows.map { it.chapter.id })
         assertEquals("file:///saved-old", rows.single().chapter.url)
         assertTrue(rows.single().isDownloaded)
-        assertEquals(fresh.id, details.chapterListForBranch(null).single().id)
+        // The downloaded upload is the one listed and read.
+        assertEquals(old.id, details.chapterListForBranch(null).single().id)
+    }
+
+    @Test
+    fun aDownloadedOlderUploadIsListedWithItsMarkInsteadOfANewerOne() {
+        val old = chapter(1, 5f, scanlator = "A", uploadDate = 100L)
+        val fresh = chapter(2, 5f, scanlator = "B", uploadDate = 200L)
+        val next = chapter(3, 6f, scanlator = "B", uploadDate = 300L)
+        val downloaded = old.copy(source = LocalMangaSource, url = "file:///saved-old")
+        val details = MangaDetails(manga(listOf(old, fresh, next))).copy(
+            localManga = LocalManga(manga(listOf(downloaded), LocalMangaSource), File("/saved.cbz")),
+        )
+        val rows = details.mapChapters(0L, 0, null, emptyList(), false, false)
+        assertEquals(listOf(old.id, next.id), rows.map { it.chapter.id })
+        assertEquals(listOf(true, false), rows.map { it.isDownloaded })
+        // The reader walks the same list and reads the stored pages.
+        val reader = details.filterChapters(null)
+        assertEquals(LocalMangaSource, reader.allChapters.first { it.id == old.id }.source)
+        assertEquals(listOf(old.id, next.id), reader.chapterListForBranch(null).map { it.id })
     }
 
     @Test
