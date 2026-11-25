@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'release/v*'
+      - 'preview/v*'
     tags:
       - 'v*'
 
@@ -43,6 +44,11 @@ jobs:
           elif [[ "$GITHUB_REF" == refs/heads/release/v* ]]; then
             VERSION="${GITHUB_REF#refs/heads/release/v}"
             RELEASE_TAG="v$VERSION"
+          elif [[ "$GITHUB_REF" == refs/heads/preview/v* ]]; then
+            # A preview: its own tag, published as a pre-release and not as the latest release.
+            VERSION="${GITHUB_REF#refs/heads/preview/v}"
+            RELEASE_TAG="v$VERSION-preview"
+            PRERELEASE=true
           else
             echo "::error::Unsupported release ref: $GITHUB_REF"
             exit 1
@@ -76,6 +82,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "version_code=$EXPECTED_CODE" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE:-false}" >> "$GITHUB_OUTPUT"
           echo "Release identity: $RELEASE_TAG, $VERSION ($EXPECTED_CODE)"
 
       - name: Verify release signing secrets
@@ -201,8 +208,8 @@ jobs:
           name: Clio ${{ steps.version.outputs.version }}
           body_path: docs/releases/${{ steps.version.outputs.version }}.md
           draft: false
-          prerelease: false
-          make_latest: true
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.version.outputs.prerelease != 'true' }}
           fail_on_unmatched_files: true
           files: |
             release-artifact/Clio-${{ steps.version.outputs.version }}-*.apk

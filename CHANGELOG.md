@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 The format is based on "Keep a Changelog" and follows semantic versioning where possible.
 
+## 10.5
+Date: 2026-11-25
+
+### Details and reader
+- Scrolling into the next chapter no longer waits for the details to finish updating. Some extensions take minutes
+  for a long chapter list; the next chapter loads right away, and "Loading" only shows while a chapter loads.
+- Switching chapters no longer cancels the update of the details, and an update no longer moves the reader back to
+  the position it was opened at.
+
+### Downloads
+- A downloaded copy of a chapter is the one listed and read when several groups have the same chapter. It keeps its
+  download mark and opens from the device, instead of a newer upload from another group being loaded from the source.
+
+### Explore
+- Extension updates stay visible in Explore after the app restarts, and the source list is built again once the
+  extensions are loaded.
+
 ## 10.4
 Date: 2026-11-21
 
